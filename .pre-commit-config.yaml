@@ -1,0 +1,69 @@
+---
+# Install:  pre-commit install
+# Run all:  pre-commit run --all-files
+#
+# Needs: helm
+#   dnf install helm
+
+default_language_version:
+  python: python3
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: '\.patch$'
+      - id: end-of-file-fixer
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=500"]
+      - id: check-case-conflict
+      - id: check-executables-have-shebangs
+      - id: check-shebang-scripts-are-executable
+      - id: check-symlinks
+      - id: destroyed-symlinks
+      - id: detect-private-key
+        # Placeholder PEM block in the example values file only.
+        # TODO: maybe delete the placeholder in future??
+        exclude: '^openshift/helm/values\.example\.yaml$'
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+      - id: check-yaml
+        # Helm templates use {{ }}; plain YAML only.
+        exclude: '^openshift/helm/templates/'
+        args: ["--allow-multiple-documents"]
+
+  - repo: https://github.com/adrienverge/yamllint
+    rev: v1.35.1
+    hooks:
+      - id: yamllint
+        args: ["-c", ".yamllint.yaml"]
+        exclude: '^openshift/helm/templates/'
+
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.10.0.1
+    hooks:
+      - id: shellcheck
+        files: \.sh$
+        args: ["--exclude=1090,1091"]
+
+  # local checks, install needed dependencies if want to use
+  - repo: local
+    hooks:
+      - id: helm-ci
+        name: helm lint + template
+        entry: bash
+        args:
+          - -c
+          - |
+            set -euo pipefail
+            helm lint openshift/helm
+            helm template ci openshift/helm \
+              -f openshift/helm/values.yaml \
+              --set-string postgres_password=ci-pre-commit \
+              --set-string frontend_backend_password=ci-pre-commit \
+              | grep -q '^kind: '
+        language: system
+        pass_filenames: false
+        files: ^openshift/helm/
