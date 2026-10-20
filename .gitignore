@@ -1,0 +1,22 @@
+# Local helm secrets
+secret*
+**/secrets.yaml
+**/secrets.yml
+
+# Helm packaging / deps
+*.tgz
+charts/
+.tmp/
+.helm/
+
+# Pre-commit / IDEs
+.pre-commit-cache/
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# nikromen's custom local render dumps
+/tmp-*.yaml
+*-rendered.yaml
+*-nosecrets.yaml
