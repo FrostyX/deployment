@@ -1,0 +1,176 @@
+---
+# Runtime spin-up only (Fedora Copr AWS AMI already has base image prep baked in).
+# prepare_base_image / libvirt / RHSM / image-bake paths intentionally omitted.
+
+- name: setup the hostname so we can easily identify the box
+  hostname: name="{{ lookup('env', 'RESALLOC_NAME', default='unknown-builder') | replace('_', '-') }}"
+
+- name: put infra stg repos into yum.repos.d if staging
+  ansible.builtin.copy:
+    src: files/dnf/infra-tags-stg.repo
+    dest: /etc/yum.repos.d
+  when: devel | bool
+
+- name: work-around for wrongly generated ami
+  ansible.builtin.file:
+    path: /etc/yum.repos.d/pr.repo
+    state: absent
+
+- name: install copr-builder and other latest packages
+  dnf:
+    state: latest
+    pkg: "{{ packages }}"
+    disable_gpg_check: true
+    use_backend: dnf5
+  vars:
+    packages:
+      - copr-builder
+      - python3-copr-common
+      - rpmlint
+      - tito
+      - fedora-review
+      - bc
+      - pyp2spec
+      - dist-git-client
+      - expect
+
+- name: make sure the copr-partitions service has already finished
+  ansible.builtin.shell: "systemctl is-active copr-partitions || :"
+  register: copr_partitions_active
+  until: "'inactive' in copr_partitions_active.stdout or 'failed' in copr_partitions_active.stdout"
+  retries: 20
+  delay: 1
+
+- name: read partitioning logs
+  ansible.builtin.shell: journalctl -u copr-partitions
+  register: journalctl_output
+
+- name: print out the copr-partitions logs
+  debug:
+    var: journalctl_output.stdout_lines
+
+- name: Collect facts about builder hardware
+  setup:
+    gather_subset:
+      - hardware
+
+- name: Make sure that we have 140G memory or SWAP for Mock caches
+  assert:
+    that:
+      - ansible_memory_mb.swap.free + ansible_memory_mb.real.free >= 1024 * 140
+    fail_msg: "Not enough memory+swap, the builder is unusable: {{ ansible_memory_mb.swap.free }} MB SWAP and {{ ansible_memory_mb.real.free }} MB RAM"
+    success_msg: "Builder has enough memory/swap!"
+
+- name: check disk space
+  include_tasks:
+    file: check_path_free_space.yml
+  vars:
+    path: "{{ item.path }}"
+    size: "{{ item.size|int }}"
+  loop:
+    - path: /var/lib/copr-rpmbuild
+      size: 15000000
+
+- name: stop and disable systemd-oomd, rhbz 2051154
+  service:
+    name: systemd-oomd
+    state: stopped
+    enabled: no
+
+- name: allow allocating large memory chunks on builders, rhbz 2051154
+  sysctl:
+    name: vm.overcommit_memory
+    value: 0
+    state: present
+
+- name: install /etc/copr-rpmbuild/mock-config-overrides
+  ansible.builtin.copy:
+    src: files/mock/
+    dest: /etc/copr-rpmbuild/mock-config-overrides
+    follow: false
+
+- name: install symlinks into /etc/copr-rpmbuild/mock-config-overrides
+  ansible.builtin.file:
+    src: /etc/mock/{{ item.to }}
+    dest: /etc/copr-rpmbuild/mock-config-overrides/{{ item.from }}
+    state: link
+  loop:
+    - from: epel-8-aarch64.cfg
+      to: rhel+epel-8-aarch64.cfg
+    - from: epel-8-x86_64.cfg
+      to: rhel+epel-8-x86_64.cfg
+    - from: epel-9-aarch64.cfg
+      to: rhel+epel-9-aarch64.cfg
+    - from: epel-9-x86_64.cfg
+      to: rhel+epel-9-x86_64.cfg
+
+- name: "allow installing RPMs with (obsolete) MD5/SHA1 digests"
+  ansible.builtin.copy:
+    content: |
+      %_pkgverify_flags 0
+    dest: /etc/rpm/macros.verify
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: run /bin/copr-update-builder from copr-builder package
+  ansible.builtin.shell: /usr/bin/copr-update-builder
+
+- name: put copr-rpmbuild configuration file in the right place
+  ansible.builtin.copy:
+    src: files/main.ini
+    dest: /etc/copr-rpmbuild/main.ini
+
+- name: mockbuilder authorized_keys
+  authorized_key:
+    user: mockbuilder
+    key: "{{ lookup('file', 'files/buildsys.pub') }}"
+
+- name: root authorized_keys
+  authorized_key:
+    user: root
+    key: "{{ lookup('file', 'files/buildsys.pub') }}"
+
+- name: mount cache filesystem on /var/cache/mock
+  mount:
+    path: /var/cache/mock
+    state: mounted
+    src: mock_cache_tmpfs
+    fstype: tmpfs
+    opts: "size=32G"
+
+- name: detect package versions
+  package_facts:
+    manager: auto
+
+- name: assure up2date packages
+  assert:
+    that:
+      - ansible_facts.packages[item.name][0].version is version(item.version, '>=')
+  loop:
+    - name: mock-core-configs
+      version: '40.2'
+    - name: copr-rpmbuild
+      version: '0.72'
+
+- name: Install custom copr-rpmbuild configs
+  ansible.builtin.copy:
+    src: files/copr-rpmbuild.yml
+    dest: /etc/copr-rpmbuild/copr-rpmbuild.yml
+
+- name: set curl user-agent for {{ item.user }}
+  ansible.builtin.copy:
+    content: |
+      user-agent = "FedoraCoprBuilderCurl/1.0"
+    dest: "{{ item.home }}/.curlrc"
+    owner: "{{ item.user }}"
+    group: "{{ item.user }}"
+    mode: "0644"
+  loop:
+    - user: mockbuilder
+      home: /home/mockbuilder
+    - user: root
+      home: /root
+
+- name: Set up motd for builder
+  ansible.builtin.shell: "copr-builder help > /etc/motd || :"

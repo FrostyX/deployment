@@ -1,0 +1,14 @@
+---
+- name: provision AWS builder
+  hosts: all
+  become: true
+  user: fedora
+
+  vars_files:
+    - vars.yml
+
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+
+  tasks:
+    - include_tasks: provision_builder_tasks.yml
