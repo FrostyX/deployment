@@ -4,12 +4,33 @@ kind: ConfigMap
 metadata:
   name: resalloc-config
 data:
-  pools.yaml: |
-{{ tpl (.Files.Get "config/resalloc-pool.yaml.j2") . | indent 4 }}
   server.yaml: |
 {{ tpl (.Files.Get "config/resalloc-server.yaml.j2") . | indent 4 }}
-  spinup-playbook.yml: |
-{{ tpl (.Files.Get "config/resalloc-spinup-playbook.yml.j2") . | indent 4 }}
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: resalloc-provision
+data:
+{{- range $path, $_ := .Files.Glob "files/provision/**" }}
+{{- $rel := trimPrefix "files/provision/" $path }}
+  {{ $rel | replace "/" "__" }}: |
+{{ $.Files.Get $path | indent 4 }}
+{{- end }}
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: builder-provision-overlays
+data:
+  rpmbuild-main.ini: |
+{{ tpl (.Files.Get "config/builder-rpmbuild-main.ini.j2") . | indent 4 }}
+  buildsys.pub: |
+{{ tpl (.Files.Get "config/builder-buildsys.pub.j2") . | indent 4 }}
+  vars.yml: |
+{{ tpl (.Files.Get "config/builder-provision-vars.yml.j2") . | indent 4 }}
 
 ---
 apiVersion: v1
@@ -18,11 +39,11 @@ metadata:
   name: resalloc-home
 type: Opaque
 data:
-  aws_config: W2RlZmF1bHRdCnJlZ2lvbiA9IHVzLWVhc3QtMQo=
+  aws_config: {{ printf "[%s]\nregion = %s\n" (.Values.aws_profile | default "default") (.Values.aws_region | default "us-east-1") | b64enc | quote }}
   aws_credentials: {{ tpl (.Files.Get "config/resalloc-aws-credentials.j2") . | b64enc | quote }}
   id_rsa: {{ .Values.aws_config.ssh_key.private | toString | b64enc | quote }}
+  id_rsa.pub: {{ .Values.aws_config.ssh_key.public | toString | b64enc | quote }}
   ssh_config: SG9zdCAqCiAgIElkZW50aXR5RmlsZSB+Ly5zc2gvaWRfcnNhCiAgIFN0cmljdEhvc3RLZXlDaGVja2luZyAgbm8KICAgVXNlcktub3duSG9zdHNGaWxlIC9kZXYvbnVsbAogICBTZXJ2ZXJBbGl2ZUludGVydmFsIDIwCiAgIFNlcnZlckFsaXZlQ291bnRNYXggNQogICBDb25uZWN0VGltZW91dCA2MAo=
-
   ansible_conf: {{ "[defaults]\nlocal_tmp=/tmp/.ansible\n[ssh_connection]\ncontrol_path_dir=/tmp/.ansible\n" | b64enc | quote }}
 
 ---
@@ -76,6 +97,50 @@ spec:
         app: copr
         component: resalloc
     spec:
+      initContainers:
+        - name: sync-provision
+          image: {{ .Values.resalloc_image | quote }}
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -ec
+            - |
+              set -euo pipefail
+              # Base: openshift/helm/files/provision → ConfigMap resalloc-provision
+              for src in /provision-src/*; do
+                [ -e "$src" ] || continue
+                key=$(basename "$src")
+                rel=${key//__//}
+                mkdir -p "/dest/$(dirname "$rel")"
+                cp "$src" "/dest/$rel"
+              done
+              # Builder provision overlays (templated in helm)
+              mkdir -p /dest/files
+              cp /overlays/rpmbuild-main.ini /dest/files/main.ini
+              cp /overlays/buildsys.pub /dest/files/buildsys.pub
+              cp /overlays/vars.yml /dest/vars.yml
+              test -f /dest/builderpb-aws.yml
+              test -f /dest/files/main.ini
+              test -f /dest/files/buildsys.pub
+              test -f /dest/vars.yml
+
+          volumeMounts:
+            - name: provision-tree
+              mountPath: /dest
+            - name: provision-src
+              mountPath: /provision-src
+              readOnly: true
+            - name: builder-overlays
+              mountPath: /overlays
+              readOnly: true
+
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
       containers:
         - name: server
           image: {{ .Values.resalloc_image }}
@@ -92,15 +157,15 @@ spec:
               mountPath: /var/log/resallocserver
             - name: resalloc-config
               mountPath: /etc/resallocserver
+            - name: provision-tree
+              mountPath: /var/lib/resallocserver/provision
             - name: resalloc-home
               mountPath: /resalloc-home
-
           env:
             - name: CONFIG_DIR
               value: /etc/resallocserver
             - name: HOME
               value: /resalloc-home
-
           command: ["/usr/bin/resalloc-server"]
           readinessProbe:
             tcpSocket:
@@ -149,8 +214,23 @@ spec:
 
       volumes:
         - name: resalloc-config
+          projected:
+            sources:
+              - configMap:
+                  name: resalloc-config
+              - configMap:
+                  name: {{ .Values.resalloc_pools_configmap | quote }}
+                  items:
+                    - key: pools.yaml
+                      path: pools.yaml
+        - name: provision-tree
+          emptyDir: {}
+        - name: provision-src
           configMap:
-            name: resalloc-config
+            name: resalloc-provision
+        - name: builder-overlays
+          configMap:
+            name: builder-provision-overlays
 
         - name: resalloc-home
           secret:
@@ -163,6 +243,8 @@ spec:
                 path: .aws/credentials
               - key: id_rsa
                 path: .ssh/id_rsa
+              # id_rsa.pub optional — not in Vault yet; builders get pubkey via
+              # overlay files/buildsys.pub once aws_config.ssh_key.public is set.
               - key: ssh_config
                 path: .ssh/config
               - key: ansible_conf
@@ -171,7 +253,6 @@ spec:
         - name: resalloc-data
           persistentVolumeClaim:
             claimName: resalloc-data
-
         - name: resalloc-logs
           emptyDir: {}
 

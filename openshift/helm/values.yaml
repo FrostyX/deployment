@@ -4,6 +4,8 @@
 project: copr-dev
 create_project: false
 deployment: dev
+devel: true
+rpm_vendor_copr_name: Copr
 
 postgres_user: copr-fe
 postgres_password: ""
@@ -24,6 +26,9 @@ copr_backend_image: quay.io/copr/backend:test
 nginx_image: quay.io/sclorg/nginx-126-c10s
 copr_distgit_image: quay.io/copr/distgit:test
 resalloc_image: quay.io/copr/resalloc:test
+resalloc_pools_configmap: resalloc-pools
+aws_profile: default
+aws_region: us-east-1
 copr_keygen_image: quay.io/copr/keygen:test
 
 aws_config:
